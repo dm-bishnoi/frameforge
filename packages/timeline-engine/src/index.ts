@@ -55,7 +55,12 @@ function assertTrackEditable(track: Track): void {
   }
 }
 
-function hasOverlap(clips: readonly Clip[], startFrame: number, durationFrames: number, ignoreClipId?: string): Clip | undefined {
+function hasOverlap(
+  clips: readonly Clip[],
+  startFrame: number,
+  durationFrames: number,
+  ignoreClipId?: string
+): Clip | undefined {
   const endFrame = startFrame + durationFrames;
   return clips.find((c) => {
     if (c.id === ignoreClipId) return false;
@@ -143,15 +148,23 @@ export function addClipToTrack(
     targetStartFrame = maxEnd;
   }
 
+  const sourceInFrame = clipInput.sourceInFrame ?? 0;
+  const playbackSpeed = clipInput.playbackSpeed ?? 1.0;
+  const computedSourceOut =
+    clipInput.sourceOutFrame ??
+    (clipInput.assetId
+      ? sourceInFrame + Math.max(1, Math.round(clipInput.durationFrames * playbackSpeed))
+      : undefined);
+
   const newClip: Clip = {
     id: clipInput.id,
     assetId: clipInput.assetId,
     trackId: clipInput.trackId,
     startFrame: targetStartFrame,
     durationFrames: clipInput.durationFrames,
-    sourceInFrame: clipInput.sourceInFrame ?? 0,
-    sourceOutFrame: clipInput.sourceOutFrame,
-    playbackSpeed: clipInput.playbackSpeed ?? 1.0,
+    sourceInFrame,
+    sourceOutFrame: computedSourceOut,
+    playbackSpeed,
     volume: clipInput.volume ?? 1.0,
     fadeInFrames: clipInput.fadeInFrames ?? 0,
     fadeOutFrames: clipInput.fadeOutFrames ?? 0,
@@ -208,7 +221,6 @@ export function moveClip(project: Project, options: MoveClipOptions): Project {
   }
   assertTrackEditable(destTrack);
 
-  // Compute snapping candidate points (0, playheadFrame, and other clip start/end edges on destTrack)
   let snappedStart = options.targetStartFrame;
   const threshold = options.snapThresholdFrames ?? 0;
   if (threshold > 0) {
@@ -255,6 +267,11 @@ export interface TrimClipOptions {
   newSourceOutFrame?: number;
 }
 
+/**
+ * Deterministically trims a clip while keeping `sourceInFrame`, `sourceOutFrame`,
+ * `durationFrames`, and `playbackSpeed` mathematically consistent:
+ * `sourceOutFrame = sourceInFrame + Math.round(durationFrames * playbackSpeed)`.
+ */
 export function trimClip(project: Project, options: TrimClipOptions): Project {
   const next = structuredClone(project);
   for (const track of next.timeline.tracks) {
@@ -263,21 +280,57 @@ export function trimClip(project: Project, options: TrimClipOptions): Project {
     assertTrackEditable(track);
 
     const nextStart = options.newStartFrame ?? clip.startFrame;
-    const nextDuration = options.newDurationFrames ?? clip.durationFrames;
     const nextSourceIn = options.newSourceInFrame ?? clip.sourceInFrame;
-    const nextSourceOut = options.newSourceOutFrame ?? clip.sourceOutFrame;
 
     if (nextStart < 0) {
       throw new Error("Invalid trim: startFrame cannot be negative");
     }
-    if (nextDuration <= 0) {
-      throw new Error("Invalid trim: durationFrames must be >= 1");
-    }
     if (nextSourceIn < 0) {
       throw new Error("Invalid trim: sourceInFrame cannot be negative");
     }
-    if (nextSourceOut !== undefined && nextSourceOut <= nextSourceIn) {
-      throw new Error("Invalid trim: sourceOutFrame must be greater than sourceInFrame");
+
+    let nextDuration: number;
+    let nextSourceOut: number | undefined;
+
+    if (options.newDurationFrames !== undefined && options.newSourceOutFrame !== undefined) {
+      nextDuration = options.newDurationFrames;
+      nextSourceOut = options.newSourceOutFrame;
+      if (nextDuration <= 0) {
+        throw new Error("Invalid trim: durationFrames must be >= 1");
+      }
+      if (nextSourceOut <= nextSourceIn) {
+        throw new Error("Invalid trim: sourceOutFrame must be greater than sourceInFrame");
+      }
+      const expectedSourceSpan = Math.max(1, Math.round(nextDuration * clip.playbackSpeed));
+      if (nextSourceOut - nextSourceIn !== expectedSourceSpan) {
+        throw new Error(
+          `Invalid trim: source span (${nextSourceOut - nextSourceIn}) does not match durationFrames * playbackSpeed (${expectedSourceSpan})`
+        );
+      }
+    } else if (options.newDurationFrames !== undefined) {
+      nextDuration = options.newDurationFrames;
+      if (nextDuration <= 0) {
+        throw new Error("Invalid trim: durationFrames must be >= 1");
+      }
+      const sourceSpan = Math.max(1, Math.round(nextDuration * clip.playbackSpeed));
+      nextSourceOut =
+        clip.assetId || clip.sourceOutFrame !== undefined
+          ? nextSourceIn + sourceSpan
+          : undefined;
+    } else if (options.newSourceOutFrame !== undefined) {
+      nextSourceOut = options.newSourceOutFrame;
+      if (nextSourceOut <= nextSourceIn) {
+        throw new Error("Invalid trim: sourceOutFrame must be greater than sourceInFrame");
+      }
+      const sourceSpan = nextSourceOut - nextSourceIn;
+      nextDuration = Math.max(1, Math.round(sourceSpan / clip.playbackSpeed));
+    } else {
+      nextDuration = clip.durationFrames;
+      const sourceSpan = Math.max(1, Math.round(nextDuration * clip.playbackSpeed));
+      nextSourceOut =
+        clip.assetId || clip.sourceOutFrame !== undefined
+          ? nextSourceIn + sourceSpan
+          : undefined;
     }
 
     const overlap = hasOverlap(track.clips, nextStart, nextDuration, clip.id);
@@ -291,7 +344,7 @@ export function trimClip(project: Project, options: TrimClipOptions): Project {
     if (nextSourceOut !== undefined) {
       clip.sourceOutFrame = nextSourceOut;
     }
-    // Clamp fades if duration shrank
+
     if (clip.fadeInFrames + clip.fadeOutFrames > clip.durationFrames) {
       clip.fadeInFrames = Math.min(clip.fadeInFrames, Math.floor(clip.durationFrames / 2));
       clip.fadeOutFrames = Math.min(clip.fadeOutFrames, clip.durationFrames - clip.fadeInFrames);
@@ -327,15 +380,16 @@ export function splitClip(project: Project, options: SplitClipOptions): Project 
 
     const leftDuration = options.splitAtFrame - clip.startFrame;
     const rightDuration = clipEnd - options.splitAtFrame;
-    const sourceFramesConsumedByLeft = Math.round(leftDuration * clip.playbackSpeed);
+    const sourceFramesConsumedByLeft = Math.max(1, Math.round(leftDuration * clip.playbackSpeed));
     const rightSourceIn = clip.sourceInFrame + sourceFramesConsumedByLeft;
+    const rightSourceSpan = Math.max(1, Math.round(rightDuration * clip.playbackSpeed));
 
     const rightId = options.rightClipId ?? `${clip.id}-part2`;
     const leftClip: Clip = {
       ...structuredClone(clip),
       durationFrames: leftDuration,
       sourceOutFrame:
-        clip.sourceOutFrame !== undefined ? rightSourceIn : undefined,
+        clip.assetId || clip.sourceOutFrame !== undefined ? rightSourceIn : undefined,
       fadeOutFrames: 0,
       transitionOut: undefined,
       keyframes: clip.keyframes.filter((kf) => kf.frameOffset <= leftDuration)
@@ -347,6 +401,10 @@ export function splitClip(project: Project, options: SplitClipOptions): Project 
       startFrame: options.splitAtFrame,
       durationFrames: rightDuration,
       sourceInFrame: rightSourceIn,
+      sourceOutFrame:
+        clip.assetId || clip.sourceOutFrame !== undefined
+          ? rightSourceIn + rightSourceSpan
+          : undefined,
       fadeInFrames: 0,
       transitionIn: undefined,
       keyframes: clip.keyframes
@@ -412,7 +470,13 @@ export function updateClipProperties(
     if (!clip) continue;
     assertTrackEditable(track);
 
-    if (patch.playbackSpeed !== undefined) clip.playbackSpeed = patch.playbackSpeed;
+    if (patch.playbackSpeed !== undefined) {
+      clip.playbackSpeed = patch.playbackSpeed;
+      if (clip.assetId || clip.sourceOutFrame !== undefined) {
+        clip.sourceOutFrame =
+          clip.sourceInFrame + Math.max(1, Math.round(clip.durationFrames * clip.playbackSpeed));
+      }
+    }
     if (patch.volume !== undefined) clip.volume = patch.volume;
     if (patch.fadeInFrames !== undefined) clip.fadeInFrames = patch.fadeInFrames;
     if (patch.fadeOutFrames !== undefined) clip.fadeOutFrames = patch.fadeOutFrames;
@@ -428,9 +492,6 @@ export function updateClipProperties(
   throw new Error(`Clip not found: ${clipId}`);
 }
 
-/**
- * Evaluates a clip keyframe property at a specific relative frameOffset using linear interpolation.
- */
 export function evaluateKeyframeAtFrame(
   clip: Clip,
   property: KeyframeProperty,
@@ -494,9 +555,6 @@ export function checkAudioVideoSync(
   };
 }
 
-/**
- * Deterministic Undo/Redo history stack for timeline editing sessions.
- */
 export class TimelineHistory {
   private past: Project[] = [];
   private present: Project;

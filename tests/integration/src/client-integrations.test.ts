@@ -7,10 +7,6 @@ import { generateDeterministicMediaFixture } from "@frameforge/media-engine";
 
 const REPO_ROOT = path.resolve(__dirname, "../../..");
 
-/**
- * Non-destructively merges FrameForge MCP server entries into an existing client config object
- * (Antigravity / Claude Desktop format) while preserving existing user MCP servers and credentials.
- */
 export function mergeMcpClientConfig(
   existingConfig: Record<string, unknown>,
   repoRoot: string,
@@ -42,10 +38,6 @@ export function mergeMcpClientConfig(
   return cloned;
 }
 
-/**
- * Sends newline-delimited JSON-RPC 2.0 requests to a spawned stdio MCP server process
- * and collects the JSON-RPC responses.
- */
 function runStdioMcpSession(
   cliScriptPath: string,
   envVars: Record<string, string>,
@@ -88,7 +80,7 @@ function runStdioMcpSession(
   });
 }
 
-describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verification", () => {
+describe("Step 11 & Priority 2 — MCP Client Integrations & Live Stdio Subprocess Verification", () => {
   it("preserves existing user MCP servers and credentials when merging Antigravity, Claude Desktop, and Codex configs", () => {
     const existingUserConfig = {
       theme: "dark",
@@ -112,19 +104,17 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
     expect(servers["frameforge-dev-mcp"]).toBeDefined();
     expect(servers["frameforge-video-mcp"]).toBeDefined();
 
-    // Verify client template files exist
     expect(fs.existsSync(path.join(REPO_ROOT, "mcp/client-configs/antigravity.mcp.json"))).toBe(true);
     expect(fs.existsSync(path.join(REPO_ROOT, "mcp/client-configs/claude_desktop_config.json"))).toBe(true);
     expect(fs.existsSync(path.join(REPO_ROOT, "mcp/client-configs/codex.config.toml"))).toBe(true);
   });
 
-  it("spawns built Development MCP and Video Editing MCP stdio servers and verifies tool discovery, repo inspection, and real video render", async () => {
+  it("spawns built Development MCP and Video Editing MCP stdio servers and verifies tools/list inputSchemas, tools/call, and real MP4 render", async () => {
     const devCli = path.join(REPO_ROOT, "mcp/dev-server/dist/cli.js");
     const videoCli = path.join(REPO_ROOT, "mcp/video-server/dist/cli.js");
     expect(fs.existsSync(devCli)).toBe(true);
     expect(fs.existsSync(videoCli)).toBe(true);
 
-    // 1. Test Development MCP over live stdio pipe
     const devResponses = await runStdioMcpSession(
       devCli,
       { FRAMEFORGE_REPO_ROOT: REPO_ROOT },
@@ -150,11 +140,17 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
     expect((devResponses[0]?.result as { serverInfo: { name: string } }).serverInfo.name).toBe(
       "frameforge-dev-mcp"
     );
+    const devTools = (
+      devResponses[1]?.result as {
+        tools: Array<{ name: string; inputSchema: { type: string } }>;
+      }
+    ).tools;
+    expect(devTools).toHaveLength(8);
+    expect(devTools.every((t) => t.inputSchema?.type === "object")).toBe(true);
     expect((devResponses[3] as { error?: { message: string } }).error?.message).toContain(
       "escapes root"
     );
 
-    // 2. Test Video Editing MCP over live stdio pipe with real project + short MP4 render
     const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "ff-stdio-video-"));
     try {
       generateDeterministicMediaFixture(path.join(tmpWorkspace, "input.mp4"), {
@@ -169,9 +165,10 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
         { FRAMEFORGE_WORKSPACE_ROOT: tmpWorkspace },
         [
           { jsonrpc: "2.0", id: 10, method: "initialize", params: {} },
+          { jsonrpc: "2.0", id: 11, method: "tools/list" },
           {
             jsonrpc: "2.0",
-            id: 11,
+            id: 12,
             method: "tools/call",
             params: {
               name: "project.create",
@@ -180,7 +177,7 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
           },
           {
             jsonrpc: "2.0",
-            id: 12,
+            id: 13,
             method: "tools/call",
             params: {
               name: "media.import",
@@ -193,7 +190,7 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
           },
           {
             jsonrpc: "2.0",
-            id: 13,
+            id: 14,
             method: "tools/call",
             params: {
               name: "timeline.add_clip",
@@ -209,7 +206,7 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
           },
           {
             jsonrpc: "2.0",
-            id: 14,
+            id: 15,
             method: "tools/call",
             params: {
               name: "render.start",
@@ -224,8 +221,16 @@ describe("Step 11 — MCP Client Integrations & Live Stdio Subprocess Verificati
         ]
       );
 
-      expect(videoResponses).toHaveLength(5);
-      const renderRes = videoResponses[4]?.result as {
+      expect(videoResponses).toHaveLength(6);
+      const videoTools = (
+        videoResponses[1]?.result as {
+          tools: Array<{ name: string; inputSchema: { type: string } }>;
+        }
+      ).tools;
+      expect(videoTools).toHaveLength(14);
+      expect(videoTools.every((t) => t.inputSchema?.type === "object")).toBe(true);
+
+      const renderRes = videoResponses[5]?.result as {
         structuredContent: { job: { status: string; validation: { valid: boolean } } };
       };
       expect(renderRes.structuredContent.job.status).toBe("completed");

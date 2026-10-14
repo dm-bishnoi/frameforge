@@ -5,13 +5,62 @@ import { describe, expect, it } from "vitest";
 import { generateDeterministicMediaFixture } from "@frameforge/media-engine";
 import { VideoEditingMcpServer } from "../index";
 
-describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E2E Render", () => {
-  it("handles MCP initialize, tools/list, and end-to-end project creation, clip editing, text overlay, rendering, and validation", () => {
+describe("@frameforge/mcp-video-server — Step 6 & Priority 2 MCP Compliance", () => {
+  it("exposes valid JSON Schema inputSchema on every tool in tools/list consistent with Zod runtime validation", () => {
+    const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "ff-video-mcp-schema-"));
+    try {
+      const server = new VideoEditingMcpServer({ workspaceRoot: tmpWorkspace });
+      const listRes = server.handleJsonRpc({
+        jsonrpc: "2.0",
+        id: 100,
+        method: "tools/list"
+      });
+
+      const tools = (
+        listRes?.result as {
+          tools: Array<{
+            name: string;
+            description: string;
+            inputSchema: {
+              type: string;
+              properties: Record<string, unknown>;
+              required?: string[];
+              additionalProperties: boolean;
+            };
+          }>;
+        }
+      ).tools;
+
+      expect(tools).toHaveLength(14);
+      for (const tool of tools) {
+        expect(tool.inputSchema).toBeDefined();
+        expect(tool.inputSchema.type).toBe("object");
+        expect(typeof tool.inputSchema.properties).toBe("object");
+        expect(tool.inputSchema.additionalProperties).toBe(false);
+        expect(Array.isArray(tool.inputSchema.required)).toBe(true);
+
+        // Reject unrecognized extra properties via strict Zod runtime validation
+        const badCall = server.handleJsonRpc({
+          jsonrpc: "2.0",
+          id: 101,
+          method: "tools/call",
+          params: {
+            name: tool.name,
+            arguments: { __unexpectedField__: true }
+          }
+        });
+        expect(badCall?.error).toBeDefined();
+      }
+    } finally {
+      fs.rmSync(tmpWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  it("handles MCP initialize, tools/list, and end-to-end project creation, clip editing with nonzero sourceInFrame, text overlay, rendering, and validation", () => {
     const tmpWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "ff-video-mcp-"));
     try {
       const server = new VideoEditingMcpServer({ workspaceRoot: tmpWorkspace });
 
-      // 1. initialize
       const initRes = server.handleJsonRpc({
         jsonrpc: "2.0",
         id: 1,
@@ -20,28 +69,16 @@ describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E
       });
       expect(initRes?.error).toBeUndefined();
 
-      // 2. tools/list
-      const listRes = server.handleJsonRpc({
-        jsonrpc: "2.0",
-        id: 2,
-        method: "tools/list"
-      });
-      const tools = (listRes?.result as { tools: Array<{ name: string }> }).tools;
-      expect(tools.length).toBeGreaterThanOrEqual(14);
-
-      // 3. Generate a confined local fixture video inside tmpWorkspace/fixtures
       generateDeterministicMediaFixture(
         path.join(tmpWorkspace, "fixtures/clip1.mp4"),
-        { durationSeconds: 2, width: 1080, height: 1920, fps: 30 }
+        { durationSeconds: 3, width: 1080, height: 1920, fps: 30 }
       );
 
-      // 4. Create project via MCP
       server.callTool("project.create", {
         projectId: "mcp-e2e-proj",
         name: "MCP E2E Vertical Video"
       });
 
-      // 5. Import media via MCP
       server.callTool("media.import", {
         projectId: "mcp-e2e-proj",
         sourceRelativePath: "fixtures/clip1.mp4",
@@ -49,16 +86,17 @@ describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E
         name: "Clip 1"
       });
 
-      // 6. Add clip & split & edit via MCP
       server.callTool("timeline.add_clip", {
         projectId: "mcp-e2e-proj",
         clipId: "clip-1",
         trackId: "track-video-1",
         assetId: "asset-1",
         startFrame: 0,
-        durationFrames: 60
+        durationFrames: 60,
+        sourceInFrame: 20
       });
 
+      // Split clip at frame 30 -> clip-2 has sourceInFrame = 50
       server.callTool("timeline.split_clip", {
         projectId: "mcp-e2e-proj",
         clipId: "clip-1",
@@ -66,7 +104,22 @@ describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E
         rightClipId: "clip-2"
       });
 
-      // Destructive delete without confirm: true must be rejected
+      // Edit clip-2 (which has nonzero sourceInFrame = 50) to newDurationFrames = 20 via tools/call
+      const editRes = server.handleJsonRpc({
+        jsonrpc: "2.0",
+        id: 50,
+        method: "tools/call",
+        params: {
+          name: "timeline.edit_clip",
+          arguments: {
+            projectId: "mcp-e2e-proj",
+            clipId: "clip-2",
+            newDurationFrames: 20
+          }
+        }
+      });
+      expect(editRes?.error).toBeUndefined();
+
       expect(() =>
         server.callTool("timeline.delete_clip", {
           projectId: "mcp-e2e-proj",
@@ -75,14 +128,12 @@ describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E
         })
       ).toThrow("requires confirm: true");
 
-      // Delete second half with confirm: true
       server.callTool("timeline.delete_clip", {
         projectId: "mcp-e2e-proj",
         clipId: "clip-2",
         confirm: true
       });
 
-      // 7. Add text overlay via MCP
       server.callTool("timeline.add_text_overlay", {
         projectId: "mcp-e2e-proj",
         clipId: "clip-text-1",
@@ -90,9 +141,9 @@ describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E
         startFrame: 0,
         durationFrames: 30,
         overlay: {
-          text: "EDITED VIA MCP",
+          text: "EDITED VIA MCP, [VERIFIED]; 100%",
           preset: "title-bold",
-          fontSize: 52,
+          fontSize: 48,
           fontColor: "#FFFFFF",
           backgroundColor: "#000000",
           x: 540,
@@ -100,14 +151,12 @@ describe("@frameforge/mcp-video-server — Step 6 Video Editing MCP Protocol & E
         }
       });
 
-      // 8. Reject path traversal on media.inspect
       expect(() =>
         server.callTool("media.inspect", {
           relativeFilePath: "../../etc/passwd"
         })
       ).toThrow("escapes root");
 
-      // 9. Render via MCP and inspect output
       const renderOut = server.callTool("render.start", {
         projectId: "mcp-e2e-proj",
         jobId: "mcp-render-job-1",

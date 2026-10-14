@@ -7,13 +7,14 @@ import {
   validateSafeProjectPath
 } from "@frameforge/project-schema";
 import { probeMediaFile } from "@frameforge/media-engine";
-import { RenderJobQueue } from "@frameforge/render-engine";
+import { escapeFfmpegDrawtextValue, RenderJobQueue } from "@frameforge/render-engine";
 import { DevelopmentMcpServer } from "@frameforge/mcp-dev-server";
 import { VideoEditingMcpServer } from "@frameforge/mcp-video-server";
 
-describe("Step 10 — Reliability & Security Hardening Suite", () => {
-  it("recovers from corrupted project files via autosave and rejects symlinks, traversal, and null bytes", () => {
+describe("Step 10 & Priority 1 Remediation — Reliability & Security Hardening Suite", () => {
+  it("recovers from corrupted project files via autosave and rejects direct symlinks, symlinked parent directories, traversal, and null bytes", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ff-sec-test-"));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "ff-sec-outside-"));
     try {
       const repo = new ProjectRepository(path.join(tmpDir, "projects"));
       const created = repo.createProject({
@@ -29,9 +30,9 @@ describe("Step 10 — Reliability & Security Hardening Suite", () => {
       const recovered = repo.loadProject("sec-proj", { allowAutosaveRecovery: true });
       expect(recovered.name).toBe("Recovered From Crash");
 
-      // Symlink escape defense
-      const outsideSecret = path.join(tmpDir, "outside-secret.mp4");
-      fs.writeFileSync(outsideSecret, "dummy", "utf8");
+      // 1. Direct symlink escape defense
+      const outsideSecret = path.join(outsideDir, "outside-secret.mp4");
+      fs.writeFileSync(outsideSecret, "dummy-secret-payload", "utf8");
       const symlinkPath = path.join(repo.getProjectDir("sec-proj"), "media/evil-link.mp4");
       fs.symlinkSync(outsideSecret, symlinkPath);
 
@@ -41,7 +42,26 @@ describe("Step 10 — Reliability & Security Hardening Suite", () => {
 
       expect(() => probeMediaFile(symlinkPath)).toThrow("Symbolic links are not permitted");
 
-      // Null byte & URL-encoded traversal defense
+      // 2. Existing regular file reached through a symlinked parent directory
+      const symlinkedParent = path.join(repo.getProjectDir("sec-proj"), "media/linked-parent");
+      fs.symlinkSync(outsideDir, symlinkedParent);
+
+      expect(() =>
+        validateSafeProjectPath(
+          repo.getProjectDir("sec-proj"),
+          "media/linked-parent/outside-secret.mp4"
+        )
+      ).toThrow("symlink escapes root");
+
+      // Also verify VideoEditingMcpServer media.inspect and Dev MCP fs.read_source reject symlinked parent escapes
+      const videoMcp = new VideoEditingMcpServer({ workspaceRoot: repo.getProjectDir("sec-proj") });
+      expect(() =>
+        videoMcp.callTool("media.inspect", {
+          relativeFilePath: "media/linked-parent/outside-secret.mp4"
+        })
+      ).toThrow("symlink escapes root");
+
+      // 3. Null byte & URL-encoded traversal defense
       expect(() =>
         validateSafeProjectPath(repo.getProjectDir("sec-proj"), "media/clip\0.mp4")
       ).toThrow("null byte");
@@ -50,13 +70,21 @@ describe("Step 10 — Reliability & Security Hardening Suite", () => {
       ).toThrow("encoded traversal");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 
-  it("enforces MCP rate quotas, cleans up cancelled/failed renders, and scrubs sensitive env vars from errors", () => {
+  it("escapes untrusted drawtext overlays, enforces MCP rate quotas, cleans up failed renders, and scrubs sensitive env vars", () => {
+    // Adversarial drawtext filtergraph injection strings
+    const injectionAttempt =
+      "Caption,null,system='id';[0:v]negate[vout]: 'quote' \"dbl\" \\slash 100%\nLine2";
+    const escaped = escapeFfmpegDrawtextValue(injectionAttempt);
+    expect(escaped).toContain("\\,null\\,");
+    expect(escaped).toContain("\\;\\[0\\\\:v\\]");
+    expect(escaped).toContain("%%");
+
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ff-quota-test-"));
     try {
-      // Rate quota enforcement on repeated MCP requests
       const videoMcp = new VideoEditingMcpServer({
         workspaceRoot: tmpDir,
         maxRequestsPerSession: 3
@@ -68,7 +96,6 @@ describe("Step 10 — Reliability & Security Hardening Suite", () => {
         videoMcp.callTool("project.inspect", { projectId: "p1" })
       ).toThrow("MCP session rate limit exceeded");
 
-      // Secret scrubbing in Development MCP JSON-RPC error responses
       process.env.ANTHROPIC_API_KEY = "sk-ant-secret-key-999999";
       const devMcp = new DevelopmentMcpServer({ repoRoot: tmpDir });
       const rpcErr = devMcp.handleJsonRpc({
@@ -84,11 +111,9 @@ describe("Step 10 — Reliability & Security Hardening Suite", () => {
       expect(JSON.stringify(rpcErr)).toContain("[REDACTED_SECRET]");
       delete process.env.ANTHROPIC_API_KEY;
 
-      // Failed render cleans up temporary working directory
       const queue = new RenderJobQueue(path.join(tmpDir, ".temp-renders"));
       const repo = new ProjectRepository(path.join(tmpDir, "projects"));
       const p1 = repo.loadProject("p1");
-      // Force failure by passing non-existent asset on disk
       p1.assets.push({
         id: "missing-asset",
         name: "missing.mp4",

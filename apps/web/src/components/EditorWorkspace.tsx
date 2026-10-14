@@ -3,9 +3,9 @@
 import React, { useState } from "react";
 import {
   type Clip,
-  createEmptyProject,
   createProjectFromTemplate,
   type FilterType,
+  getFrameRateValue,
   type Project,
   VERTICAL_VIDEO_TEMPLATES
 } from "@frameforge/project-schema";
@@ -24,9 +24,10 @@ import { getRenderEngineCapability } from "@frameforge/render-engine";
 import { inspectAiAdapterStatus } from "@frameforge/ai-adapters";
 
 export function formatTimecode(frame: number, fps = 30): string {
+  const nominalFps = Math.max(1, Math.round(fps));
   const safeFrame = Math.max(0, Math.floor(frame));
-  const ff = safeFrame % fps;
-  const totalSeconds = Math.floor(safeFrame / fps);
+  const ff = safeFrame % nominalFps;
+  const totalSeconds = Math.floor(safeFrame / nominalFps);
   const ss = totalSeconds % 60;
   const mm = Math.floor(totalSeconds / 60) % 60;
   const hh = Math.floor(totalSeconds / 3600);
@@ -92,7 +93,7 @@ export type EditorAction =
   | { type: "SPLIT_SELECTED_AT_PLAYHEAD"; rightClipId?: string }
   | { type: "DELETE_SELECTED_CLIP"; ripple?: boolean }
   | { type: "MOVE_SELECTED_CLIP"; targetStartFrame: number }
-  | { type: "TRIM_SELECTED_CLIP"; newDurationFrames: number }
+  | { type: "TRIM_SELECTED_CLIP"; newDurationFrames: number; newSourceInFrame?: number }
   | { type: "UPDATE_SELECTED_CLIP_SPEED"; playbackSpeed: number }
   | { type: "UPDATE_SELECTED_CLIP_VOLUME"; volume: number }
   | { type: "ADD_FILTER_TO_SELECTED"; filterType: FilterType; value: number }
@@ -166,7 +167,7 @@ export function dispatchEditorAction(state: EditorState, action: EditorAction): 
       const updated = trimClip(currentProject, {
         clipId: state.selectedClipId,
         newDurationFrames: action.newDurationFrames,
-        newSourceOutFrame: action.newDurationFrames
+        newSourceInFrame: action.newSourceInFrame
       });
       state.history.commit(updated);
       return { ...state, autosaveTimestampIso: updated.updatedAtIso };
@@ -244,9 +245,7 @@ export function EditorWorkspace() {
   const renderCap = getRenderEngineCapability();
   const aiStatus = inspectAiAdapterStatus();
   const selectedClip = findSelectedClip(project, editorState.selectedClipId);
-  const fps = Math.round(
-    project.timeline.frameRate.numerator / (project.timeline.frameRate.denominator || 1)
-  );
+  const fps = Math.round(getFrameRateValue(project.timeline.frameRate) * 100) / 100;
 
   const activeTextClips = project.timeline.tracks
     .filter((t) => t.kind === "text" && t.visible)
@@ -260,7 +259,6 @@ export function EditorWorkspace() {
 
   return (
     <div className="flex min-h-screen flex-col bg-zinc-950 text-zinc-100">
-      {/* Top Toolbar */}
       <header
         role="banner"
         aria-label="Editor top toolbar"
@@ -320,9 +318,7 @@ export function EditorWorkspace() {
         </div>
       </header>
 
-      {/* Main 3-Column Workspace */}
       <div className="grid flex-1 grid-cols-1 gap-4 p-4 lg:grid-cols-12">
-        {/* Left Column: Media Library & Templates */}
         <aside
           aria-label="Media library and templates"
           className="flex flex-col gap-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 lg:col-span-3"
@@ -389,11 +385,7 @@ export function EditorWorkspace() {
               {aiStatus.adapters.map((adapter) => (
                 <li key={adapter.id} className="flex items-center justify-between">
                   <span>{adapter.displayName}</span>
-                  <span
-                    className={
-                      adapter.configured ? "text-emerald-400" : "text-zinc-500"
-                    }
-                  >
+                  <span className={adapter.configured ? "text-emerald-400" : "text-zinc-500"}>
                     {adapter.configured ? "Configured" : "Unconfigured"}
                   </span>
                 </li>
@@ -402,7 +394,6 @@ export function EditorWorkspace() {
           </div>
         </aside>
 
-        {/* Center Column: Real Preview Player */}
         <section
           aria-label="Video preview monitor"
           className="flex flex-col items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 lg:col-span-6"
@@ -414,7 +405,6 @@ export function EditorWorkspace() {
             </span>
           </div>
 
-          {/* 9:16 Vertical Preview Stage */}
           <div className="relative my-4 flex aspect-[9/16] h-80 flex-col items-center justify-center overflow-hidden rounded-lg border border-zinc-700 bg-black shadow-inner">
             <div className="text-center text-xs text-zinc-500">
               <p className="font-mono text-zinc-300">
@@ -435,7 +425,6 @@ export function EditorWorkspace() {
             ))}
           </div>
 
-          {/* Transport Controls */}
           <div className="flex items-center gap-3">
             <button
               type="button"
@@ -474,7 +463,6 @@ export function EditorWorkspace() {
           </div>
         </section>
 
-        {/* Right Column: Editable Properties Inspector */}
         <aside
           aria-label="Clip properties inspector"
           className="flex flex-col gap-4 rounded-lg border border-zinc-800 bg-zinc-900/60 p-4 lg:col-span-3"
@@ -490,6 +478,10 @@ export function EditorWorkspace() {
                   Timeline: {selectedClip.startFrame}f –{" "}
                   {selectedClip.startFrame + selectedClip.durationFrames}f (
                   {selectedClip.durationFrames}f)
+                </p>
+                <p className="text-zinc-400">
+                  Source In/Out: {selectedClip.sourceInFrame}f –{" "}
+                  {selectedClip.sourceOutFrame ?? "auto"}f
                 </p>
                 <p className="text-zinc-400">
                   Speed: {selectedClip.playbackSpeed}x • Volume:{" "}
@@ -576,7 +568,6 @@ export function EditorWorkspace() {
         </aside>
       </div>
 
-      {/* Bottom Multi-Track Timeline */}
       <section
         aria-label="Multi-track timeline editor"
         className="border-t border-zinc-800 bg-zinc-900/90 p-4"

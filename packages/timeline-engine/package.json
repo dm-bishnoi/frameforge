@@ -1,6 +1,6 @@
 {
   "name": "@frameforge/timeline-engine",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,7 +12,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@frameforge/project-schema": "workspace:*"

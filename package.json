@@ -1,6 +1,6 @@
 {
   "name": "frameforge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Local-first AI-powered video editing platform with Development MCP and Video Editing MCP integrations",
   "packageManager": "pnpm@9.15.0",

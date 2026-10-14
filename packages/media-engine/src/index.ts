@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 import {
+  getFrameRateValue,
   isSafeRelativeMediaPath,
   type MediaAsset,
   type Project,
@@ -16,7 +17,8 @@ export const SUPPORTED_AUDIO_EXTENSIONS = [".wav", ".mp3", ".aac", ".flac"] as c
 export const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"] as const;
 export const SUPPORTED_SUBTITLE_EXTENSIONS = [".srt", ".vtt", ".json"] as const;
 
-export const MAX_MEDIA_FILE_BYTES = 500 * 1024 * 1024; // 500 MB quota
+export const MAX_SOURCE_MEDIA_BYTES = 500 * 1024 * 1024; // 500 MB source media limit
+export const MAX_MEDIA_FILE_BYTES = MAX_SOURCE_MEDIA_BYTES;
 
 export const MediaProbeDescriptorSchema = z.object({
   extension: z.string().startsWith("."),
@@ -62,10 +64,19 @@ export const MediaProbeResultSchema = z.object({
 
 export type MediaProbeResult = z.infer<typeof MediaProbeResultSchema>;
 
+export interface ProbeMediaOptions {
+  maxBytes?: number;
+}
+
 /**
  * Inspects a local media file using ffprobe with array arguments (never shell interpolation).
+ * Enforces `maxBytes` (defaulting to `MAX_SOURCE_MEDIA_BYTES`).
  */
-export function probeMediaFile(filePath: string, targetFps = 30): MediaProbeResult {
+export function probeMediaFile(
+  filePath: string,
+  targetFps = 30,
+  options?: ProbeMediaOptions
+): MediaProbeResult {
   if (!filePath || filePath.includes("\0")) {
     throw new Error("Invalid media file path");
   }
@@ -77,8 +88,12 @@ export function probeMediaFile(filePath: string, targetFps = 30): MediaProbeResu
   if (stat.isSymbolicLink()) {
     throw new Error(`Symbolic links are not permitted for media probing: ${resolved}`);
   }
-  if (stat.size > MAX_MEDIA_FILE_BYTES) {
-    throw new Error(`Media file exceeds maximum allowed quota (${stat.size} bytes)`);
+
+  const maxAllowedBytes = options?.maxBytes ?? MAX_SOURCE_MEDIA_BYTES;
+  if (stat.size > maxAllowedBytes) {
+    throw new Error(
+      `Media file exceeds maximum allowed quota (${stat.size} bytes > ${maxAllowedBytes} bytes)`
+    );
   }
 
   const extInfo = classifyMediaExtension(path.extname(resolved));
@@ -91,7 +106,7 @@ export function probeMediaFile(filePath: string, targetFps = 30): MediaProbeResu
       filePath: resolved,
       category: "subtitle",
       durationSeconds: 1,
-      durationFrames: targetFps,
+      durationFrames: Math.max(1, Math.round(targetFps)),
       fps: targetFps,
       hasVideo: false,
       hasAudio: false,
@@ -135,16 +150,15 @@ export function probeMediaFile(filePath: string, targetFps = 30): MediaProbeResu
     const num = Number(parts[0]);
     const den = Number(parts[1] ?? "1");
     if (num > 0 && den > 0) {
-      fps = Math.round((num / den) * 100) / 100;
+      fps = num / den;
     }
   }
 
   const durationSecondsRaw = Number(
     parsed.format?.duration ?? videoStream?.duration ?? audioStream?.duration ?? "1"
   );
-  const durationSeconds = Number.isFinite(durationSecondsRaw) && durationSecondsRaw > 0
-    ? durationSecondsRaw
-    : 1;
+  const durationSeconds =
+    Number.isFinite(durationSecondsRaw) && durationSecondsRaw > 0 ? durationSecondsRaw : 1;
   const durationFrames = Math.max(1, Math.round(durationSeconds * targetFps));
 
   return MediaProbeResultSchema.parse({
@@ -163,18 +177,16 @@ export function probeMediaFile(filePath: string, targetFps = 30): MediaProbeResu
   });
 }
 
-/**
- * Safely copies and registers a local media file into a project's `media/` directory.
- */
 export function importMediaIntoProject(
   repo: ProjectRepository,
   project: Project,
   sourceFilePath: string,
-  options: { assetId: string; name?: string }
+  options: { assetId: string; name?: string; maxSourceBytes?: number }
 ): { project: Project; asset: MediaAsset; probe: MediaProbeResult } {
-  const fps =
-    project.timeline.frameRate.numerator / (project.timeline.frameRate.denominator || 1);
-  const probe = probeMediaFile(sourceFilePath, fps);
+  const fps = getFrameRateValue(project.timeline.frameRate);
+  const probe = probeMediaFile(sourceFilePath, fps, {
+    maxBytes: options.maxSourceBytes ?? MAX_SOURCE_MEDIA_BYTES
+  });
 
   const rawBasename = path.basename(sourceFilePath).replace(/[^a-zA-Z0-9._-]/g, "_");
   const relativePath = `media/${options.assetId}-${rawBasename}`;
@@ -209,16 +221,13 @@ export function importMediaIntoProject(
   return { project: validated, asset, probe };
 }
 
-/**
- * Generates a small deterministic vertical MP4 or WAV fixture using FFmpeg without shell strings.
- */
 export function generateDeterministicMediaFixture(
   targetFilePath: string,
   options?: {
     durationSeconds?: number;
     width?: number;
     height?: number;
-    fps?: number;
+    fps?: number | string;
     color?: string;
     frequencyHz?: number;
     audioOnly?: boolean;

@@ -4,11 +4,20 @@ import * as path from "node:path";
 import { z } from "zod";
 import {
   type Clip,
+  formatRationalFrameRate,
+  getFrameRateValue,
   type Project,
   ProjectSchema,
   validateSafeProjectPath
 } from "@frameforge/project-schema";
-import { probeMediaFile, type MediaProbeResult } from "@frameforge/media-engine";
+import {
+  MAX_SOURCE_MEDIA_BYTES,
+  probeMediaFile,
+  type MediaProbeResult
+} from "@frameforge/media-engine";
+
+export const MAX_RENDERED_OUTPUT_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB rendered output limit (distinct from 500 MB MAX_SOURCE_MEDIA_BYTES)
+export { MAX_SOURCE_MEDIA_BYTES };
 
 export const RenderJobStatusSchema = z.enum([
   "queued",
@@ -41,10 +50,10 @@ export function getRenderEngineCapability(): RenderEngineCapability {
       "saturation",
       "blur",
       "grayscale",
-      "playbackSpeed (0.25x-4.0x)",
+      "playbackSpeed (0.25x-4.0x with chained atempo)",
       "audioFadeIn / audioFadeOut",
       "transition:fade",
-      "textOverlay (drawtext)"
+      "textOverlay (drawtext with full filtergraph escaping)"
     ],
     unsupportedFeatures: [
       "4K UHD export (unverified / disabled)",
@@ -69,21 +78,17 @@ export interface RemotionCompositionDescriptor {
   width: number;
   height: number;
   fps: number;
+  rationalFps: string;
   durationInFrames: number;
   sequences: RemotionSequenceItem[];
 }
 
-/**
- * Generates a Remotion-compatible composition manifest from a validated Project.
- */
 export function buildRemotionCompositionDescriptor(
   project: Project
 ): RemotionCompositionDescriptor {
   const validated = ProjectSchema.parse(project);
-  const fps = Math.round(
-    validated.timeline.frameRate.numerator /
-      (validated.timeline.frameRate.denominator || 1)
-  );
+  const fps = getFrameRateValue(validated.timeline.frameRate);
+  const rationalFps = formatRationalFrameRate(validated.timeline.frameRate);
   const sequences: RemotionSequenceItem[] = [];
   let maxEnd = 0;
 
@@ -109,18 +114,95 @@ export function buildRemotionCompositionDescriptor(
     width: validated.timeline.resolution.width,
     height: validated.timeline.resolution.height,
     fps,
-    durationInFrames: Math.max(fps, maxEnd),
+    rationalFps,
+    durationInFrames: Math.max(Math.ceil(fps), maxEnd),
     sequences
   };
 }
 
-function escapeDrawtext(text: string): string {
-  return text
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "")
-    .replace(/%/g, "\\%")
-    .replace(/\r?\n/g, " ");
+/**
+ * Escapes untrusted caption / textOverlay strings for FFmpeg `drawtext` inside `-filter_complex`.
+ * Handles backslashes (`\`), colons (`:`), commas (`,`), semicolons (`;`), brackets (`[` `]`),
+ * single quotes (`'`), double quotes (`"`), percent signs (`%`), and multiline text (`\r\n`, `\n`).
+ *
+ * In FFmpeg's `avfilter_graph_parse2`:
+ * - Level 1 (option parser): `\` escapes `:`, `'`, and `\`
+ * - Level 2 (filtergraph parser): `\` escapes `,`, `;`, `[`, `]`, `'`, `"`, and `\`
+ */
+export function escapeFfmpegDrawtextValue(rawText: string): string {
+  const normalizedNewlines = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  let out = "";
+  for (const ch of normalizedNewlines) {
+    switch (ch) {
+      case "\\":
+        out += "\\\\\\\\";
+        break;
+      case "'":
+        out += "\\\\\\'";
+        break;
+      case '"':
+        out += '\\\\"';
+        break;
+      case ":":
+        out += "\\\\:";
+        break;
+      case ",":
+        out += "\\,";
+        break;
+      case ";":
+        out += "\\;";
+        break;
+      case "[":
+        out += "\\[";
+        break;
+      case "]":
+        out += "\\]";
+        break;
+      case "%":
+        out += "%%";
+        break;
+      default:
+        out += ch;
+        break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Builds an accurate FFmpeg `atempo` filter chain across the full 0.25x–4.0x range.
+ * Since each FFmpeg `atempo` instance only accepts [0.5, 2.0], speeds <0.5 or >2.0
+ * are decomposed into chained `atempo` filters (e.g. 0.25x -> `atempo=0.5000,atempo=0.5000`;
+ * 4.0x -> `atempo=2.0000,atempo=2.0000`).
+ * Explicitly rejects unsupported speeds outside [0.25, 4.0].
+ */
+export function buildAtempoFilterChain(playbackSpeed: number): string[] {
+  if (!Number.isFinite(playbackSpeed) || playbackSpeed < 0.25 || playbackSpeed > 4.0) {
+    throw new Error(
+      `Unsupported audio playbackSpeed (${playbackSpeed}): must be between 0.25x and 4.0x`
+    );
+  }
+  if (Math.abs(playbackSpeed - 1.0) < 1e-6) {
+    return [];
+  }
+
+  const chain: string[] = [];
+  let remaining = playbackSpeed;
+
+  while (remaining < 0.5 - 1e-9) {
+    chain.push("atempo=0.5000");
+    remaining /= 0.5;
+  }
+  while (remaining > 2.0 + 1e-9) {
+    chain.push("atempo=2.0000");
+    remaining /= 2.0;
+  }
+  if (Math.abs(remaining - 1.0) >= 1e-4 || chain.length === 0) {
+    const clampedFinal = Math.max(0.5, Math.min(2.0, remaining));
+    chain.push(`atempo=${clampedFinal.toFixed(4)}`);
+  }
+
+  return chain;
 }
 
 function resolveSystemFontPath(): string | undefined {
@@ -150,11 +232,19 @@ function buildVideoClipFilterChain(clip: Clip, fps: number): string[] {
   }
 
   const clipDurationSec = clip.durationFrames / fps;
-  if (clip.transitionIn && clip.transitionIn.type !== "none" && clip.transitionIn.durationFrames > 0) {
+  if (
+    clip.transitionIn &&
+    clip.transitionIn.type !== "none" &&
+    clip.transitionIn.durationFrames > 0
+  ) {
     const dur = (clip.transitionIn.durationFrames / fps).toFixed(3);
     filters.push(`fade=t=in:st=0:d=${dur}`);
   }
-  if (clip.transitionOut && clip.transitionOut.type !== "none" && clip.transitionOut.durationFrames > 0) {
+  if (
+    clip.transitionOut &&
+    clip.transitionOut.type !== "none" &&
+    clip.transitionOut.durationFrames > 0
+  ) {
     const durSec = clip.transitionOut.durationFrames / fps;
     const stSec = Math.max(0, clipDurationSec - durSec);
     filters.push(`fade=t=out:st=${stSec.toFixed(3)}:d=${durSec.toFixed(3)}`);
@@ -163,21 +253,16 @@ function buildVideoClipFilterChain(clip: Clip, fps: number): string[] {
   return filters;
 }
 
-/**
- * Builds safe FFmpeg array arguments (zero shell interpolation) for a project render.
- */
 export function buildFfmpegRenderCommand(
   project: Project,
   projectDir: string,
   outputFilePath: string
-): { args: string[]; totalDurationFrames: number; fps: number } {
+): { args: string[]; totalDurationFrames: number; fps: number; rationalFps: string } {
   const validated = ProjectSchema.parse(project);
   const width = validated.timeline.resolution.width;
   const height = validated.timeline.resolution.height;
-  const fps = Math.round(
-    validated.timeline.frameRate.numerator /
-      (validated.timeline.frameRate.denominator || 1)
-  );
+  const fps = getFrameRateValue(validated.timeline.frameRate);
+  const rationalFps = formatRationalFrameRate(validated.timeline.frameRate);
 
   const assetMap = new Map(validated.assets.map((a) => [a.id, a]));
   const videoTracks = validated.timeline.tracks.filter((t) => t.kind === "video" && t.visible);
@@ -204,18 +289,16 @@ export function buildFfmpegRenderCommand(
       if (end > maxEndFrame) maxEndFrame = end;
     }
   }
-  const totalDurationFrames = Math.max(fps, maxEndFrame);
+  const totalDurationFrames = Math.max(Math.ceil(fps), maxEndFrame);
   const totalDurationSec = Number((totalDurationFrames / fps).toFixed(3));
 
   const args: string[] = ["-y"];
-  // Input 0: base black canvas for the full timeline duration
   args.push(
     "-f",
     "lavfi",
     "-i",
-    `color=c=${validated.settings.backgroundColor.replace("#", "0x")}:s=${width}x${height}:r=${fps}:d=${totalDurationSec}`
+    `color=c=${validated.settings.backgroundColor.replace("#", "0x")}:s=${width}x${height}:r=${rationalFps}:d=${totalDurationSec}`
   );
-  // Input 1: base silent stereo audio for the full timeline duration
   args.push(
     "-f",
     "lavfi",
@@ -226,7 +309,13 @@ export function buildFfmpegRenderCommand(
   );
 
   let nextInputIdx = 2;
-  const videoClipInputs: Array<{ inputIdx: number; clip: Clip; trackMuted: boolean; trackVolume: number; hasAudio: boolean }> = [];
+  const videoClipInputs: Array<{
+    inputIdx: number;
+    clip: Clip;
+    trackMuted: boolean;
+    trackVolume: number;
+    hasAudio: boolean;
+  }> = [];
   for (const item of allVideoClips) {
     const asset = item.clip.assetId ? assetMap.get(item.clip.assetId) : undefined;
     if (!asset) continue;
@@ -261,7 +350,11 @@ export function buildFfmpegRenderCommand(
   videoClipInputs.forEach((vItem, idx) => {
     const { inputIdx, clip } = vItem;
     const srcStartSec = (clip.sourceInFrame / fps).toFixed(3);
-    const srcDurationSec = ((clip.durationFrames * clip.playbackSpeed) / fps).toFixed(3);
+    const srcSpanFrames =
+      clip.sourceOutFrame !== undefined
+        ? clip.sourceOutFrame - clip.sourceInFrame
+        : clip.durationFrames * clip.playbackSpeed;
+    const srcDurationSec = (srcSpanFrames / fps).toFixed(3);
     const dstStartSec = (clip.startFrame / fps).toFixed(3);
     const dstEndSec = ((clip.startFrame + clip.durationFrames) / fps).toFixed(3);
     const speedPts = (1 / clip.playbackSpeed).toFixed(4);
@@ -291,13 +384,10 @@ export function buildFfmpegRenderCommand(
       const effectiveVol = (clip.volume * vItem.trackVolume).toFixed(3);
       const aFilters: string[] = [
         `atrim=start=${srcStartSec}:duration=${srcDurationSec}`,
-        `asetpts=PTS-STARTPTS`
+        `asetpts=PTS-STARTPTS`,
+        ...buildAtempoFilterChain(clip.playbackSpeed),
+        `volume=${effectiveVol}`
       ];
-      if (clip.playbackSpeed !== 1.0) {
-        const clampedSpeed = Math.max(0.5, Math.min(2.0, clip.playbackSpeed));
-        aFilters.push(`atempo=${clampedSpeed.toFixed(3)}`);
-      }
-      aFilters.push(`volume=${effectiveVol}`);
       if (clip.fadeInFrames > 0) {
         aFilters.push(`afade=t=in:st=0:d=${(clip.fadeInFrames / fps).toFixed(3)}`);
       }
@@ -314,17 +404,16 @@ export function buildFfmpegRenderCommand(
     }
   });
 
-  // Apply text overlays via drawtext if system font is present
   const fontFile = resolveSystemFontPath();
   if (fontFile && allTextClips.length > 0) {
     allTextClips.forEach((tClip, idx) => {
       const overlay = tClip.textOverlay!;
       const startSec = (tClip.startFrame / fps).toFixed(3);
       const endSec = ((tClip.startFrame + tClip.durationFrames) / fps).toFixed(3);
-      const safeText = escapeDrawtext(overlay.text);
+      const safeText = escapeFfmpegDrawtextValue(overlay.text);
       const nextLabel = `[vtxt${idx}]`;
       const fontColor = overlay.fontColor.replace("#", "0x");
-      const drawtextFilter = `drawtext=fontfile='${fontFile}':text='${safeText}':fontsize=${overlay.fontSize}:fontcolor=${fontColor}:x=(w-text_w)/2:y=${overlay.y}:enable='between(t,${startSec},${endSec})'`;
+      const drawtextFilter = `drawtext=fontfile='${fontFile}':expansion=none:text=${safeText}:fontsize=${overlay.fontSize}:fontcolor=${fontColor}:x=(w-text_w)/2:y=${overlay.y}:enable='between(t,${startSec},${endSec})'`;
       filterParts.push(`${currentVideoLabel}${drawtextFilter}${nextLabel}`);
       currentVideoLabel = nextLabel;
     });
@@ -333,20 +422,21 @@ export function buildFfmpegRenderCommand(
   audioClipInputs.forEach((aItem, idx) => {
     const { inputIdx, clip, trackVolume } = aItem;
     const srcStartSec = (clip.sourceInFrame / fps).toFixed(3);
-    const srcDurationSec = ((clip.durationFrames * clip.playbackSpeed) / fps).toFixed(3);
+    const srcSpanFrames =
+      clip.sourceOutFrame !== undefined
+        ? clip.sourceOutFrame - clip.sourceInFrame
+        : clip.durationFrames * clip.playbackSpeed;
+    const srcDurationSec = (srcSpanFrames / fps).toFixed(3);
     const delayMs = Math.round((clip.startFrame / fps) * 1000);
     const effectiveVol = (clip.volume * trackVolume).toFixed(3);
     const aLabel = `[aaud${idx}]`;
 
     const aFilters: string[] = [
       `atrim=start=${srcStartSec}:duration=${srcDurationSec}`,
-      `asetpts=PTS-STARTPTS`
+      `asetpts=PTS-STARTPTS`,
+      ...buildAtempoFilterChain(clip.playbackSpeed),
+      `volume=${effectiveVol}`
     ];
-    if (clip.playbackSpeed !== 1.0) {
-      const clampedSpeed = Math.max(0.5, Math.min(2.0, clip.playbackSpeed));
-      aFilters.push(`atempo=${clampedSpeed.toFixed(3)}`);
-    }
-    aFilters.push(`volume=${effectiveVol}`);
     if (clip.fadeInFrames > 0) {
       aFilters.push(`afade=t=in:st=0:d=${(clip.fadeInFrames / fps).toFixed(3)}`);
     }
@@ -383,7 +473,7 @@ export function buildFfmpegRenderCommand(
     "-preset",
     "ultrafast",
     "-r",
-    String(fps),
+    rationalFps,
     "-c:a",
     "aac",
     "-ar",
@@ -393,7 +483,7 @@ export function buildFfmpegRenderCommand(
     path.resolve(outputFilePath)
   );
 
-  return { args, totalDurationFrames, fps };
+  return { args, totalDurationFrames, fps, rationalFps };
 }
 
 export interface RenderOutputValidation {
@@ -402,22 +492,23 @@ export interface RenderOutputValidation {
   extractedFramePath?: string;
 }
 
-/**
- * Validates a rendered MP4 using ffprobe and optionally extracts a representative PNG frame.
- */
 export function validateRenderedOutput(
   outputFilePath: string,
-  expected: { width: number; height: number; fps: number },
+  expected: { width: number; height: number; fps: number; maxOutputBytes?: number },
   extractFrameToPath?: string
 ): RenderOutputValidation {
-  const probe = probeMediaFile(outputFilePath, expected.fps);
+  const probe = probeMediaFile(outputFilePath, expected.fps, {
+    maxBytes: expected.maxOutputBytes ?? MAX_RENDERED_OUTPUT_BYTES
+  });
+  const fpsMatches = Math.abs(probe.fps - expected.fps) <= 0.05;
   const valid =
     probe.hasVideo &&
     probe.hasAudio &&
     probe.width === expected.width &&
     probe.height === expected.height &&
-    Math.round(probe.fps) === expected.fps &&
-    probe.sizeBytes > 0;
+    fpsMatches &&
+    probe.sizeBytes > 0 &&
+    probe.sizeBytes <= (expected.maxOutputBytes ?? MAX_RENDERED_OUTPUT_BYTES);
 
   if (extractFrameToPath) {
     const resolvedFrame = path.resolve(extractFrameToPath);
@@ -446,10 +537,6 @@ export interface RenderJobRecord {
   validation?: RenderOutputValidation;
 }
 
-/**
- * RenderJobQueue manages asynchronous and synchronous FFmpeg rendering jobs with
- * unique IDs, progress tracking, cancellation, temporary file cleanup, and output validation.
- */
 export class RenderJobQueue {
   private readonly jobs = new Map<string, RenderJobRecord>();
   private readonly activeProcesses = new Map<string, ChildProcess>();
@@ -469,9 +556,6 @@ export class RenderJobQueue {
     return Array.from(this.jobs.values()).map((j) => structuredClone(j));
   }
 
-  /**
-   * Synchronous render execution helper for deterministic workflows and MCP/CLI tests.
-   */
   public renderProjectSync(input: {
     jobId: string;
     project: Project;
@@ -537,9 +621,6 @@ export class RenderJobQueue {
     return structuredClone(record);
   }
 
-  /**
-   * Starts an asynchronous render job that can be polled or cancelled via `cancelJob(jobId)`.
-   */
   public startRenderJob(input: {
     jobId: string;
     project: Project;

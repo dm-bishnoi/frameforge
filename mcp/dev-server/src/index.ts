@@ -33,6 +33,19 @@ export function getDevMcpServerDescriptor() {
   return DEV_MCP_SERVER_INFO;
 }
 
+export interface DevMcpJsonSchema {
+  type: "object";
+  properties: Record<string, Record<string, unknown>>;
+  required?: string[];
+  additionalProperties: boolean;
+}
+
+export interface DevMcpToolDefinition {
+  name: DevToolName;
+  description: string;
+  inputSchema: DevMcpJsonSchema;
+}
+
 const APPROVED_TOP_PATHS = new Set([
   "apps",
   "packages",
@@ -58,7 +71,94 @@ export function buildSanitizedEnv(rawEnv: NodeJS.ProcessEnv = process.env): Node
   return clean;
 }
 
-export function scrubSensitiveOutputText(text: string, rawEnv: NodeJS.ProcessEnv = process.env): string {
+/**
+ * Cross-platform PATH prepender using `;` on Windows (`win32`) and `:` on POSIX (`path.delimiter`),
+ * updating both `PATH` and `Path` when present on Windows.
+ */
+export function prependToPathEnv(
+  env: NodeJS.ProcessEnv,
+  binDir: string,
+  platform: NodeJS.Platform = process.platform
+): NodeJS.ProcessEnv {
+  const delimiter = platform === "win32" ? ";" : ":";
+  const nextEnv: NodeJS.ProcessEnv = { ...env };
+  const existingPath = nextEnv.PATH ?? nextEnv.Path ?? (platform === "win32" ? "" : "/usr/bin:/bin");
+  const combined = existingPath ? `${binDir}${delimiter}${existingPath}` : binDir;
+  nextEnv.PATH = combined;
+  if (platform === "win32" && "Path" in nextEnv) {
+    nextEnv.Path = combined;
+  }
+  return nextEnv;
+}
+
+/**
+ * Safely resolves allowlisted executables (`git` or `pnpm`) across Windows and POSIX
+ * without enabling arbitrary shell execution (`shell: false`).
+ *
+ * - If a local Node-based pnpm entrypoint (`node_modules/.bin/pnpm` or `pnpm.cjs`) exists,
+ *   runs it directly via `process.execPath` (`node`) with `shell: false`.
+ * - On Windows (`win32`), searches `PATH` (split by `;`) for `pnpm.cjs`, `pnpm.exe`, `git.exe`,
+ *   or `pnpm.cmd` without shell interpolation.
+ */
+export function resolveAllowlistedExecutable(
+  binary: "git" | "pnpm",
+  repoRoot: string,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env
+): { command: string; prefixArgs: string[] } {
+  const binDir = path.join(repoRoot, "node_modules", ".bin");
+
+  if (binary === "pnpm") {
+    const localNodePnpm = path.join(binDir, "pnpm");
+    const localPnpmCjs = path.join(binDir, "pnpm.cjs");
+    if (fs.existsSync(localPnpmCjs)) {
+      return { command: process.execPath, prefixArgs: [localPnpmCjs] };
+    }
+    if (fs.existsSync(localNodePnpm)) {
+      try {
+        const head = fs.readFileSync(localNodePnpm, "utf8").slice(0, 64);
+        if (head.startsWith("#!/usr/bin/env node") || head.includes("node")) {
+          return { command: process.execPath, prefixArgs: [localNodePnpm] };
+        }
+      } catch {
+        // Fall through
+      }
+      if (platform !== "win32") {
+        return { command: localNodePnpm, prefixArgs: [] };
+      }
+    }
+  }
+
+  const delimiter = platform === "win32" ? ";" : ":";
+  const rawPath = env.PATH ?? env.Path ?? "";
+  const searchDirs = [binDir, ...rawPath.split(delimiter).filter(Boolean)];
+
+  const extensions =
+    platform === "win32"
+      ? binary === "pnpm"
+        ? [".exe", ".cjs", ".cmd"]
+        : [".exe", ""]
+      : [""];
+
+  for (const dir of searchDirs) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, `${binary}${ext}`);
+      if (fs.existsSync(candidate)) {
+        if (ext === ".cjs") {
+          return { command: process.execPath, prefixArgs: [candidate] };
+        }
+        return { command: candidate, prefixArgs: [] };
+      }
+    }
+  }
+
+  return { command: platform === "win32" ? `${binary}.exe` : binary, prefixArgs: [] };
+}
+
+export function scrubSensitiveOutputText(
+  text: string,
+  rawEnv: NodeJS.ProcessEnv = process.env
+): string {
   let out = text;
   for (const [key, val] of Object.entries(rawEnv)) {
     if (SENSITIVE_ENV_KEY_PATTERN.test(key) && val && val.length >= 6) {
@@ -82,6 +182,8 @@ export function truncateBoundedOutput(
   };
 }
 
+const EmptyObjectArgsSchema = z.object({}).strict();
+
 const ReadSourceArgsSchema = z
   .object({
     relativePath: z.string().min(1).max(260)
@@ -102,6 +204,103 @@ const CheckCommandArgsSchema = z
   })
   .strict();
 
+export const DEV_MCP_TOOL_DEFINITIONS: readonly DevMcpToolDefinition[] = [
+  {
+    name: "git.status",
+    description: "Inspect repository Git status (branch and modified/staged files)",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "fs.read_source",
+    description: "Read an approved source file inside the repository",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relativePath: { type: "string", minLength: 1, maxLength: 260 }
+      },
+      required: ["relativePath"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "code.search",
+    description: "Search approved source files for a literal query string",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", minLength: 1, maxLength: 120 },
+        maxResults: { type: "integer", minimum: 1, maximum: 100, default: 25 }
+      },
+      required: ["query"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "check.typecheck",
+    description: "Run allowlisted TypeScript compiler checks across workspaces",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeoutMs: { type: "integer", minimum: 500, maximum: 60000, default: 30000 }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "check.lint",
+    description: "Run allowlisted ESLint checks across workspaces",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeoutMs: { type: "integer", minimum: 500, maximum: 60000, default: 30000 }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "check.test",
+    description: "Run allowlisted Vitest unit tests",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeoutMs: { type: "integer", minimum: 500, maximum: 60000, default: 30000 },
+        filter: { type: "string", maxLength: 80 }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "check.build",
+    description: "Run allowlisted workspace build",
+    inputSchema: {
+      type: "object",
+      properties: {
+        timeoutMs: { type: "integer", minimum: 500, maximum: 60000, default: 30000 }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "diagnostics.summary",
+    description: "Retrieve sanitized workspace diagnostics without secrets",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  }
+];
+
 export interface CommandExecutionResult {
   success: boolean;
   exitCode: number | null;
@@ -118,17 +317,8 @@ export class DevelopmentMcpServer {
     this.repoRoot = path.resolve(options.repoRoot);
   }
 
-  public listTools() {
-    return [
-      { name: "git.status", description: "Inspect repository Git status (branch and modified/staged files)" },
-      { name: "fs.read_source", description: "Read an approved source file inside the repository" },
-      { name: "code.search", description: "Search approved source files for a literal query string" },
-      { name: "check.typecheck", description: "Run allowlisted TypeScript compiler checks across workspaces" },
-      { name: "check.lint", description: "Run allowlisted ESLint checks across workspaces" },
-      { name: "check.test", description: "Run allowlisted Vitest unit tests" },
-      { name: "check.build", description: "Run allowlisted workspace build" },
-      { name: "diagnostics.summary", description: "Retrieve sanitized workspace diagnostics without secrets" }
-    ];
+  public listTools(): readonly DevMcpToolDefinition[] {
+    return DEV_MCP_TOOL_DEFINITIONS;
   }
 
   private assertApprovedSourcePath(relativePath: string): string {
@@ -168,31 +358,31 @@ export class DevelopmentMcpServer {
     timeoutMs = 20000
   ): CommandExecutionResult {
     for (const arg of args) {
-      if (arg.includes("\0") || /[;&|`$<>]/.test(arg)) {
+      if (arg.includes("\0") || /[;&|`$<>()\r\n]/.test(arg)) {
         throw new Error(`Rejected unsafe command argument: ${arg}`);
       }
     }
 
-    const binDir = path.join(this.repoRoot, "node_modules/.bin");
-    const resolvedBinary =
-      binary === "pnpm" && fs.existsSync(path.join(binDir, "pnpm"))
-        ? path.join(binDir, "pnpm")
-        : binary;
+    const binDir = path.join(this.repoRoot, "node_modules", ".bin");
+    const cleanEnv = prependToPathEnv(buildSanitizedEnv(process.env), binDir, process.platform);
+    const resolvedExec = resolveAllowlistedExecutable(binary, this.repoRoot, process.platform, cleanEnv);
 
-    const cleanEnv = buildSanitizedEnv(process.env);
-    cleanEnv.PATH = `${binDir}:${cleanEnv.PATH ?? "/usr/bin:/bin"}`;
-
-    const proc = spawnSync(resolvedBinary, args, {
+    const proc = spawnSync(resolvedExec.command, [...resolvedExec.prefixArgs, ...args], {
       cwd: this.repoRoot,
       env: cleanEnv,
       encoding: "utf8",
       timeout: timeoutMs,
-      maxBuffer: 2 * 1024 * 1024
+      maxBuffer: 2 * 1024 * 1024,
+      shell: false
     });
 
-    const timedOut = Boolean(proc.error && (proc.error as NodeJS.ErrnoException).code === "ETIMEDOUT");
+    const timedOut = Boolean(
+      proc.error && (proc.error as NodeJS.ErrnoException).code === "ETIMEDOUT"
+    );
     const outBound = truncateBoundedOutput(proc.stdout ?? "");
-    const errBound = truncateBoundedOutput(proc.stderr ?? (proc.error ? proc.error.message : ""));
+    const errBound = truncateBoundedOutput(
+      proc.stderr ?? (proc.error ? proc.error.message : "")
+    );
 
     return {
       success: !timedOut && proc.status === 0,
@@ -226,6 +416,7 @@ export class DevelopmentMcpServer {
 
     switch (toolName) {
       case "git.status": {
+        EmptyObjectArgsSchema.parse(rawArgs);
         return this.runAllowlistedCommand("git", ["status", "--short", "--branch"], 10000);
       }
       case "fs.read_source": {
@@ -278,12 +469,14 @@ export class DevelopmentMcpServer {
         return this.runAllowlistedCommand("pnpm", ["build"], args.timeoutMs);
       }
       case "diagnostics.summary": {
+        EmptyObjectArgsSchema.parse(rawArgs);
         const safeEnvKeys = Object.keys(buildSanitizedEnv(process.env));
         return {
           server: DEV_MCP_SERVER_INFO.name,
           version: DEV_MCP_SERVER_INFO.version,
           nodeVersion: process.version,
           platform: process.platform,
+          pathDelimiter: path.delimiter,
           allowArbitraryShellExecution: false,
           exposedEnvVarCount: safeEnvKeys.length,
           secretsRedacted: true

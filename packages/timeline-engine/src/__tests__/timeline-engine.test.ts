@@ -42,7 +42,7 @@ function createSampleProjectWithAsset() {
   return base;
 }
 
-describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
+describe("@frameforge/timeline-engine — Step 4 & Remediation Operations", () => {
   it("adds, moves with snapping, trims, splits, and ripple-deletes clips deterministically", () => {
     let project = createSampleProjectWithAsset();
 
@@ -56,7 +56,6 @@ describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
       sourceOutFrame: 120
     });
 
-    // Reject overlapping clip by default
     expect(() =>
       addClipToTrack(project, {
         id: "clip-overlap",
@@ -67,7 +66,6 @@ describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
       })
     ).toThrow("overlaps");
 
-    // Split clip at frame 50
     project = splitClip(project, {
       clipId: "clip-v1",
       splitAtFrame: 50,
@@ -81,8 +79,8 @@ describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
     expect(videoTrack.clips[1]?.startFrame).toBe(50);
     expect(videoTrack.clips[1]?.durationFrames).toBe(70);
     expect(videoTrack.clips[1]?.sourceInFrame).toBe(50);
+    expect(videoTrack.clips[1]?.sourceOutFrame).toBe(120);
 
-    // Move second clip with snapping to playhead at frame 100
     project = moveClip(project, {
       clipId: "clip-v2",
       targetStartFrame: 97,
@@ -93,19 +91,75 @@ describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
       project.timeline.tracks.find((t) => t.id === "track-video-1")?.clips[1]?.startFrame
     ).toBe(100);
 
-    // Trim first clip duration to 40 frames
     project = trimClip(project, {
       clipId: "clip-v1",
-      newDurationFrames: 40,
-      newSourceOutFrame: 40
+      newDurationFrames: 40
     });
     expect(summarizeTimeline(project.timeline).durationFrames).toBe(170);
 
-    // Ripple delete first clip shifts second clip left by 40 frames (from 100 to 60)
     project = deleteClip(project, { clipId: "clip-v1", ripple: true });
     const remaining = project.timeline.tracks.find((t) => t.id === "track-video-1")?.clips;
     expect(remaining).toHaveLength(1);
     expect(remaining?.[0]?.startFrame).toBe(60);
+  });
+
+  it("correctly computes sourceOutFrame across nonzero sourceInFrame, playback-speed changes, and repeated trims", () => {
+    let project = createSampleProjectWithAsset();
+
+    // Add clip starting at sourceInFrame = 60, duration = 40, speed = 1.0 -> sourceOutFrame = 100
+    project = addClipToTrack(project, {
+      id: "clip-nonzero-in",
+      assetId: "asset-v1",
+      trackId: "track-video-1",
+      startFrame: 10,
+      durationFrames: 40,
+      sourceInFrame: 60
+    });
+
+    let clip = project.timeline.tracks[0]!.clips[0]!;
+    expect(clip.sourceInFrame).toBe(60);
+    expect(clip.sourceOutFrame).toBe(100);
+
+    // First trim: shorten durationFrames to 25 (smaller than sourceInFrame 60!)
+    // Previously this buggy path set sourceOutFrame = 25 <= sourceInFrame (60).
+    // Now sourceOutFrame must be 60 + 25 = 85.
+    project = trimClip(project, {
+      clipId: "clip-nonzero-in",
+      newDurationFrames: 25
+    });
+    clip = project.timeline.tracks[0]!.clips[0]!;
+    expect(clip.durationFrames).toBe(25);
+    expect(clip.sourceInFrame).toBe(60);
+    expect(clip.sourceOutFrame).toBe(85);
+
+    // Change playbackSpeed to 2.0 -> sourceOutFrame becomes 60 + 25 * 2 = 110
+    project = updateClipProperties(project, "clip-nonzero-in", {
+      playbackSpeed: 2.0
+    });
+    clip = project.timeline.tracks[0]!.clips[0]!;
+    expect(clip.playbackSpeed).toBe(2.0);
+    expect(clip.sourceOutFrame).toBe(110);
+
+    // Second trim at 2.0x speed: newSourceInFrame = 80, newDurationFrames = 30 -> sourceOutFrame = 80 + 30 * 2 = 140
+    project = trimClip(project, {
+      clipId: "clip-nonzero-in",
+      newSourceInFrame: 80,
+      newDurationFrames: 30
+    });
+    clip = project.timeline.tracks[0]!.clips[0]!;
+    expect(clip.sourceInFrame).toBe(80);
+    expect(clip.durationFrames).toBe(30);
+    expect(clip.sourceOutFrame).toBe(140);
+
+    // Third trim by specifying newSourceOutFrame = 120 at 2.0x speed -> durationFrames = (120 - 80) / 2 = 20
+    project = trimClip(project, {
+      clipId: "clip-nonzero-in",
+      newSourceOutFrame: 120
+    });
+    clip = project.timeline.tracks[0]!.clips[0]!;
+    expect(clip.sourceInFrame).toBe(80);
+    expect(clip.sourceOutFrame).toBe(120);
+    expect(clip.durationFrames).toBe(20);
   });
 
   it("enforces track locking, negative position rejection, undo/redo, keyframes, and AV sync", () => {
@@ -132,7 +186,6 @@ describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
 
     expect(checkAudioVideoSync(history.current(), "clip-v1", "clip-a1").synchronized).toBe(true);
 
-    // Update keyframes & effects on clip-v1
     const withEffects = updateClipProperties(history.current(), "clip-v1", {
       playbackSpeed: 1.5,
       fadeInFrames: 10,
@@ -150,13 +203,9 @@ describe("@frameforge/timeline-engine — Step 4 & Step 9 Operations", () => {
       .timeline.tracks.find((t) => t.id === "track-video-1")!.clips[0]!;
     expect(evaluateKeyframeAtFrame(updatedClip, "opacity", 15, 1)).toBe(0.5);
 
-    // Lock track and verify edits are rejected
     const locked = setTrackState(history.current(), "track-video-1", { locked: true });
-    expect(() =>
-      deleteClip(locked, { clipId: "clip-v1" })
-    ).toThrow("locked");
+    expect(() => deleteClip(locked, { clipId: "clip-v1" })).toThrow("locked");
 
-    // Undo / Redo round trip
     expect(history.canUndo()).toBe(true);
     history.undo();
     expect(

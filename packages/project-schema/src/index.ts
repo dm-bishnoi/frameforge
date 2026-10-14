@@ -17,12 +17,29 @@ export type Resolution = z.infer<typeof ResolutionSchema>;
 
 export const FrameRateSchema = z
   .object({
-    numerator: z.number().int().positive().max(240),
-    denominator: z.number().int().positive().default(1)
+    numerator: z.number().int().positive().max(240000),
+    denominator: z.number().int().positive().max(10000).default(1)
   })
-  .strict();
+  .strict()
+  .superRefine((fr, ctx) => {
+    const fps = fr.numerator / (fr.denominator || 1);
+    if (!Number.isFinite(fps) || fps < 1 || fps > 240) {
+      ctx.addIssue({
+        path: ["numerator"],
+        message: `Effective frame rate (${fps.toFixed(3)} fps) must be between 1 and 240 fps`
+      });
+    }
+  });
 
 export type FrameRate = z.infer<typeof FrameRateSchema>;
+
+export function getFrameRateValue(frameRate: FrameRate): number {
+  return frameRate.numerator / (frameRate.denominator || 1);
+}
+
+export function formatRationalFrameRate(frameRate: FrameRate): string {
+  return `${frameRate.numerator}/${frameRate.denominator || 1}`;
+}
 
 export const ProjectSettingsSchema = z
   .object({
@@ -61,7 +78,7 @@ export function isSafeRelativeMediaPath(relPath: string): boolean {
 
 /**
  * Resolves a candidate path inside a base root directory, rejecting path traversal,
- * null bytes, and symbolic links that escape the base directory.
+ * null bytes, direct symlinks, and symlinked parent/ancestor directories.
  */
 export function validateSafeProjectPath(baseRootDir: string, candidateSubPath: string): string {
   if (!candidateSubPath || typeof candidateSubPath !== "string") {
@@ -70,11 +87,11 @@ export function validateSafeProjectPath(baseRootDir: string, candidateSubPath: s
   if (candidateSubPath.includes("\0")) {
     throw new Error("Path validation failed: null byte detected");
   }
-  if (/%2e/i.test(candidateSubPath)) {
+  if (/%2e/i.test(candidateSubPath) || /%2f/i.test(candidateSubPath) || /%5c/i.test(candidateSubPath)) {
     throw new Error("Path validation failed: encoded traversal sequence detected");
   }
-  if (path.isAbsolute(candidateSubPath) || /^[a-zA-Z]:/.test(candidateSubPath)) {
-    throw new Error(`Path validation failed: absolute path not allowed (${candidateSubPath})`);
+  if (path.isAbsolute(candidateSubPath) || /^[a-zA-Z]:/.test(candidateSubPath) || candidateSubPath.includes("\\")) {
+    throw new Error(`Path validation failed: absolute or backslash path not allowed (${candidateSubPath})`);
   }
 
   const resolvedBase = path.resolve(baseRootDir);
@@ -87,18 +104,44 @@ export function validateSafeProjectPath(baseRootDir: string, candidateSubPath: s
 
   if (fs.existsSync(resolvedBase)) {
     const realBase = fs.realpathSync(resolvedBase);
-    let current = resolvedTarget;
-    while (!fs.existsSync(current) && current !== path.dirname(current)) {
-      current = path.dirname(current);
-    }
-    if (fs.existsSync(current)) {
-      const lstat = fs.lstatSync(current);
-      if (lstat.isSymbolicLink()) {
-        const realTarget = fs.realpathSync(current);
-        const relReal = path.relative(realBase, realTarget);
-        if (relReal.startsWith("..") || path.isAbsolute(relReal)) {
+
+    // 1. Walk every path segment from resolvedBase down to resolvedTarget.
+    // Reject if any existing intermediate parent directory or leaf is a symbolic link.
+    const segments = relative.split(path.sep).filter(Boolean);
+    let currentWalk = resolvedBase;
+    for (const seg of segments) {
+      currentWalk = path.join(currentWalk, seg);
+      if (fs.existsSync(currentWalk)) {
+        const lstat = fs.lstatSync(currentWalk);
+        if (lstat.isSymbolicLink()) {
           throw new Error(`Path validation failed: symlink escapes root directory (${candidateSubPath})`);
         }
+      } else {
+        // Also check if a broken symlink exists at currentWalk
+        try {
+          const lstat = fs.lstatSync(currentWalk);
+          if (lstat.isSymbolicLink()) {
+            throw new Error(`Path validation failed: symlink escapes root directory (${candidateSubPath})`);
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.includes("symlink escapes root")) {
+            throw err;
+          }
+        }
+        break;
+      }
+    }
+
+    // 2. Unconditionally verify realpath of the deepest existing ancestor/target against realBase.
+    let deepestExisting = resolvedTarget;
+    while (!fs.existsSync(deepestExisting) && deepestExisting !== path.dirname(deepestExisting)) {
+      deepestExisting = path.dirname(deepestExisting);
+    }
+    if (fs.existsSync(deepestExisting)) {
+      const realDeepest = fs.realpathSync(deepestExisting);
+      const relReal = path.relative(realBase, realDeepest);
+      if (relReal.startsWith("..") || path.isAbsolute(relReal)) {
+        throw new Error(`Path validation failed: symlink escapes root directory (${candidateSubPath})`);
       }
     }
   }
@@ -474,9 +517,6 @@ export function createEmptyProject(input: CreateEmptyProjectInput): Project {
   return ProjectSchema.parse(raw);
 }
 
-/**
- * Migrates a raw project payload from v0.1.0 (or current v0.2.0) to validated v0.2.0 Project.
- */
 export function migrateProjectSchema(rawInput: unknown): Project {
   if (typeof rawInput !== "object" || rawInput === null || Array.isArray(rawInput)) {
     throw new Error("Cannot migrate non-object project payload");
@@ -694,11 +734,6 @@ export interface ProjectSummaryItem {
   hasAutosave: boolean;
 }
 
-/**
- * Local-first Project Repository managing isolated project directories,
- * separating project metadata (`project.json`) from imported media (`media/`),
- * and providing deterministic autosave & recovery.
- */
 export class ProjectRepository {
   public readonly workspaceProjectsRoot: string;
 

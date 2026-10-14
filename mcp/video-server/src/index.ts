@@ -3,6 +3,7 @@ import * as readline from "node:readline";
 import { z } from "zod";
 import {
   FilterEffectSchema,
+  getFrameRateValue,
   ProjectRepository,
   ProjectSchema,
   TextOverlaySchema,
@@ -56,6 +57,19 @@ export function getVideoMcpServerDescriptor() {
   return VIDEO_MCP_SERVER_INFO;
 }
 
+export interface McpJsonSchema {
+  type: "object";
+  properties: Record<string, Record<string, unknown>>;
+  required?: string[];
+  additionalProperties: boolean;
+}
+
+export interface McpToolDefinition {
+  name: VideoToolName;
+  description: string;
+  inputSchema: McpJsonSchema;
+}
+
 const ProjectCreateArgsSchema = z
   .object({
     projectId: z.string().min(1).max(80),
@@ -101,7 +115,10 @@ const TimelineEditClipArgsSchema = z
   .object({
     projectId: z.string().min(1).max(80),
     clipId: z.string().min(1).max(80),
+    newStartFrame: z.number().int().nonnegative().optional(),
     newDurationFrames: z.number().int().positive().optional(),
+    newSourceInFrame: z.number().int().nonnegative().optional(),
+    newSourceOutFrame: z.number().int().positive().optional(),
     playbackSpeed: z.number().min(0.25).max(4.0).optional(),
     volume: z.number().min(0).max(2.0).optional(),
     fadeInFrames: z.number().int().nonnegative().optional(),
@@ -161,6 +178,250 @@ const RenderInspectOutputArgsSchema = z
   })
   .strict();
 
+export const VIDEO_MCP_TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
+  {
+    name: "project.create",
+    description: "Create a new vertical 1080x1920@30fps video project",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        name: { type: "string", minLength: 1, maxLength: 120 }
+      },
+      required: ["projectId", "name"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "project.inspect",
+    description: "Inspect a saved project model and metadata",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 }
+      },
+      required: ["projectId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "project.validate",
+    description: "Validate project integrity, assets, and track/clip IDs",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 }
+      },
+      required: ["projectId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "media.inspect",
+    description: "Inspect a confined local media file using ffprobe",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relativeFilePath: { type: "string", minLength: 1 }
+      },
+      required: ["relativeFilePath"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "media.import",
+    description: "Import a confined local media file into a project",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        sourceRelativePath: { type: "string", minLength: 1 },
+        assetId: { type: "string", minLength: 1, maxLength: 80 },
+        name: { type: "string", minLength: 1, maxLength: 120 }
+      },
+      required: ["projectId", "sourceRelativePath", "assetId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "timeline.inspect",
+    description: "Summarize project timeline tracks, clips, and duration",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 }
+      },
+      required: ["projectId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "timeline.add_clip",
+    description: "Add a media clip onto a project timeline track",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        clipId: { type: "string", minLength: 1, maxLength: 80 },
+        trackId: { type: "string", minLength: 1, maxLength: 80 },
+        assetId: { type: "string", minLength: 1, maxLength: 80 },
+        startFrame: { type: "integer", minimum: 0 },
+        durationFrames: { type: "integer", exclusiveMinimum: 0 },
+        sourceInFrame: { type: "integer", minimum: 0, default: 0 },
+        sourceOutFrame: { type: "integer", exclusiveMinimum: 0 }
+      },
+      required: ["projectId", "clipId", "trackId", "assetId", "startFrame", "durationFrames"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "timeline.edit_clip",
+    description: "Edit clip trim, playbackSpeed, volume, fades, or effects",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        clipId: { type: "string", minLength: 1, maxLength: 80 },
+        newStartFrame: { type: "integer", minimum: 0 },
+        newDurationFrames: { type: "integer", exclusiveMinimum: 0 },
+        newSourceInFrame: { type: "integer", minimum: 0 },
+        newSourceOutFrame: { type: "integer", exclusiveMinimum: 0 },
+        playbackSpeed: { type: "number", minimum: 0.25, maximum: 4.0 },
+        volume: { type: "number", minimum: 0, maximum: 2.0 },
+        fadeInFrames: { type: "integer", minimum: 0 },
+        fadeOutFrames: { type: "integer", minimum: 0 },
+        transitionIn: {
+          type: "object",
+          properties: {
+            type: { type: "string", enum: ["none", "fade", "wipeleft", "dissolve"] },
+            durationFrames: { type: "integer", minimum: 0, maximum: 300 }
+          },
+          additionalProperties: false
+        },
+        effects: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: {
+                type: "string",
+                enum: ["brightness", "contrast", "saturation", "blur", "grayscale"]
+              },
+              value: { type: "number" }
+            },
+            required: ["type", "value"],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ["projectId", "clipId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "timeline.split_clip",
+    description: "Split a clip at a specific timeline frame",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        clipId: { type: "string", minLength: 1, maxLength: 80 },
+        splitAtFrame: { type: "integer", exclusiveMinimum: 0 },
+        rightClipId: { type: "string", minLength: 1, maxLength: 80 }
+      },
+      required: ["projectId", "clipId", "splitAtFrame"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "timeline.delete_clip",
+    description: "Delete a clip from a track (requires confirm: true)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        clipId: { type: "string", minLength: 1, maxLength: 80 },
+        ripple: { type: "boolean", default: false },
+        confirm: { type: "boolean" }
+      },
+      required: ["projectId", "clipId", "confirm"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "timeline.add_text_overlay",
+    description: "Add a styled text overlay clip to a text track",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        clipId: { type: "string", minLength: 1, maxLength: 80 },
+        trackId: { type: "string", minLength: 1, maxLength: 80, default: "track-text-1" },
+        startFrame: { type: "integer", minimum: 0 },
+        durationFrames: { type: "integer", exclusiveMinimum: 0 },
+        overlay: {
+          type: "object",
+          properties: {
+            text: { type: "string", minLength: 1, maxLength: 500 },
+            preset: {
+              type: "string",
+              enum: ["title-bold", "lower-third", "caption-pill", "center-callout"]
+            },
+            fontSize: { type: "integer", minimum: 12, maximum: 200 },
+            fontColor: { type: "string", pattern: "^#[0-9a-fA-F]{6}$" },
+            backgroundColor: { type: "string", pattern: "^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$" },
+            x: { type: "integer", minimum: 0, maximum: 3840 },
+            y: { type: "integer", minimum: 0, maximum: 3840 }
+          },
+          required: ["text"],
+          additionalProperties: false
+        }
+      },
+      required: ["projectId", "clipId", "startFrame", "durationFrames", "overlay"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "render.start",
+    description: "Render a project to a 1080x1920@30fps MP4 (requires confirm: true)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", minLength: 1, maxLength: 80 },
+        jobId: { type: "string", minLength: 1, maxLength: 80 },
+        outputRelativePath: { type: "string", minLength: 1 },
+        confirm: { type: "boolean" }
+      },
+      required: ["projectId", "jobId", "outputRelativePath", "confirm"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "render.status",
+    description: "Check status and validation of a render job by jobId",
+    inputSchema: {
+      type: "object",
+      properties: {
+        jobId: { type: "string", minLength: 1, maxLength: 80 }
+      },
+      required: ["jobId"],
+      additionalProperties: false
+    }
+  },
+  {
+    name: "render.inspect_output",
+    description: "Inspect a rendered MP4 output file via ffprobe",
+    inputSchema: {
+      type: "object",
+      properties: {
+        outputRelativePath: { type: "string", minLength: 1 }
+      },
+      required: ["outputRelativePath"],
+      additionalProperties: false
+    }
+  }
+];
+
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
   id?: string | number | null;
@@ -192,23 +453,8 @@ export class VideoEditingMcpServer {
     this.maxRequestsPerSession = options.maxRequestsPerSession ?? 500;
   }
 
-  public listTools() {
-    return [
-      { name: "project.create", description: "Create a new vertical 1080x1920@30fps video project" },
-      { name: "project.inspect", description: "Inspect a saved project model and metadata" },
-      { name: "project.validate", description: "Validate project integrity, assets, and track/clip IDs" },
-      { name: "media.inspect", description: "Inspect a confined local media file using ffprobe" },
-      { name: "media.import", description: "Import a confined local media file into a project" },
-      { name: "timeline.inspect", description: "Summarize project timeline tracks, clips, and duration" },
-      { name: "timeline.add_clip", description: "Add a media clip onto a project timeline track" },
-      { name: "timeline.edit_clip", description: "Edit clip trim, playbackSpeed, volume, fades, or effects" },
-      { name: "timeline.split_clip", description: "Split a clip at a specific timeline frame" },
-      { name: "timeline.delete_clip", description: "Delete a clip from a track (requires confirm: true)" },
-      { name: "timeline.add_text_overlay", description: "Add a styled text overlay clip to a text track" },
-      { name: "render.start", description: "Render a project to a 1080x1920@30fps MP4 (requires confirm: true)" },
-      { name: "render.status", description: "Check status and validation of a render job by jobId" },
-      { name: "render.inspect_output", description: "Inspect a rendered MP4 output file via ffprobe" }
-    ];
+  public listTools(): readonly McpToolDefinition[] {
+    return VIDEO_MCP_TOOL_DEFINITIONS;
   }
 
   public callTool(name: string, rawArgs: unknown): unknown {
@@ -281,15 +527,26 @@ export class VideoEditingMcpServer {
       case "timeline.edit_clip": {
         const args = TimelineEditClipArgsSchema.parse(rawArgs);
         let project = this.repo.loadProject(args.projectId);
-        if (args.newDurationFrames !== undefined) {
+        if (args.playbackSpeed !== undefined) {
+          project = updateClipProperties(project, args.clipId, {
+            playbackSpeed: args.playbackSpeed
+          });
+        }
+        if (
+          args.newStartFrame !== undefined ||
+          args.newDurationFrames !== undefined ||
+          args.newSourceInFrame !== undefined ||
+          args.newSourceOutFrame !== undefined
+        ) {
           project = trimClip(project, {
             clipId: args.clipId,
+            newStartFrame: args.newStartFrame,
             newDurationFrames: args.newDurationFrames,
-            newSourceOutFrame: args.newDurationFrames
+            newSourceInFrame: args.newSourceInFrame,
+            newSourceOutFrame: args.newSourceOutFrame
           });
         }
         project = updateClipProperties(project, args.clipId, {
-          playbackSpeed: args.playbackSpeed,
           volume: args.volume,
           fadeInFrames: args.fadeInFrames,
           fadeOutFrames: args.fadeOutFrames,

@@ -5,6 +5,9 @@ import { describe, expect, it } from "vitest";
 import {
   createEmptyProject,
   createProjectFromTemplate,
+  formatRationalFrameRate,
+  FrameRateSchema,
+  getFrameRateValue,
   isSafeRelativeMediaPath,
   LEGACY_SCHEMA_VERSION,
   migrateProjectSchema,
@@ -14,8 +17,8 @@ import {
   validateSafeProjectPath
 } from "../index";
 
-describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => {
-  it("creates a valid vertical 1080x1920@30fps project by default", () => {
+describe("@frameforge/project-schema — Step 2 & Remediation Verification", () => {
+  it("creates a valid vertical 1080x1920@30fps project by default and supports rational NTSC frame rates (30000/1001)", () => {
     const project = createEmptyProject({
       id: "proj-001",
       name: "Vertical Short",
@@ -28,6 +31,15 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
     expect(project.timeline.resolution).toEqual({ width: 1080, height: 1920 });
     expect(project.timeline.frameRate).toEqual({ numerator: 30, denominator: 1 });
     expect(project.timeline.tracks).toHaveLength(3);
+
+    // Rational 29.97 fps (30000/1001) and 23.976 fps (24000/1001)
+    const ntsc = FrameRateSchema.parse({ numerator: 30000, denominator: 1001 });
+    expect(Math.round(getFrameRateValue(ntsc) * 100) / 100).toBe(29.97);
+    expect(formatRationalFrameRate(ntsc)).toBe("30000/1001");
+
+    // Reject out-of-range effective FPS (<1 or >240)
+    expect(FrameRateSchema.safeParse({ numerator: 500, denominator: 1 }).success).toBe(false);
+    expect(FrameRateSchema.safeParse({ numerator: 1, denominator: 10 }).success).toBe(false);
   });
 
   it("rejects invalid resolution dimensions and invalid durations", () => {
@@ -55,7 +67,6 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
       createDefaultTracks: true
     });
 
-    // Missing asset reference
     const missingAssetResult = ProjectSchema.safeParse({
       ...base,
       timeline: {
@@ -91,7 +102,6 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
     });
     expect(missingAssetResult.success).toBe(false);
 
-    // Duplicate asset IDs
     const dupAssetsResult = ProjectSchema.safeParse({
       ...base,
       assets: [
@@ -101,7 +111,6 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
     });
     expect(dupAssetsResult.success).toBe(false);
 
-    // Invalid sourceOutFrame <= sourceInFrame
     const badTrimResult = ProjectSchema.safeParse({
       ...base,
       assets: [
@@ -142,7 +151,7 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
     expect(badTrimResult.success).toBe(false);
   });
 
-  it("prevents path traversal, absolute paths, and symlink escapes", () => {
+  it("prevents path traversal, absolute paths, direct symlinks, and symlinked parent directory escapes", () => {
     expect(isSafeRelativeMediaPath("media/clip.mp4")).toBe(true);
     expect(isSafeRelativeMediaPath("../secret.txt")).toBe(false);
     expect(isSafeRelativeMediaPath("media/../../etc/passwd")).toBe(false);
@@ -151,11 +160,38 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
     expect(isSafeRelativeMediaPath("media/clip%2e%2e.mp4")).toBe(false);
 
     const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ff-path-test-"));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "ff-outside-dir-"));
     try {
-      expect(() => validateSafeProjectPath(tmpRoot, "../outside")).toThrow("escapes root");
-      expect(() => validateSafeProjectPath(tmpRoot, "/etc/passwd")).toThrow("absolute path");
+      const projectDir = path.join(tmpRoot, "proj1");
+      fs.mkdirSync(path.join(projectDir, "media"), { recursive: true });
+
+      const outsideFile = path.join(outsideDir, "secret-regular.mp4");
+      fs.writeFileSync(outsideFile, "outside-secret-content", "utf8");
+
+      // 1. Direct symlink leaf
+      const leafLink = path.join(projectDir, "media", "direct-link.mp4");
+      fs.symlinkSync(outsideFile, leafLink);
+      expect(() => validateSafeProjectPath(projectDir, "media/direct-link.mp4")).toThrow(
+        "symlink escapes root"
+      );
+
+      // 2. Existing regular file reached through a symlinked parent directory
+      const parentLink = path.join(projectDir, "media", "symlinked-subdir");
+      fs.symlinkSync(outsideDir, parentLink);
+      expect(() =>
+        validateSafeProjectPath(projectDir, "media/symlinked-subdir/secret-regular.mp4")
+      ).toThrow("symlink escapes root");
+
+      // 3. Non-existent file reached through a symlinked parent directory
+      expect(() =>
+        validateSafeProjectPath(projectDir, "media/symlinked-subdir/new-write.mp4")
+      ).toThrow("symlink escapes root");
+
+      expect(() => validateSafeProjectPath(projectDir, "../outside")).toThrow("escapes root");
+      expect(() => validateSafeProjectPath(projectDir, "/etc/passwd")).toThrow("absolute");
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 
@@ -173,7 +209,6 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
       expect(listed).toHaveLength(1);
       expect(listed[0]?.id).toBe("demo-project");
 
-      // Update and autosave
       const modified = {
         ...created,
         name: "Autosaved Title",
@@ -181,18 +216,14 @@ describe("@frameforge/project-schema — Step 2 & Step 9 Project Engine", () => 
       };
       repo.autosaveProject(modified);
 
-      // Simulate corrupted main project.json
       const mainPath = path.join(repo.getProjectDir("demo-project"), "project.json");
       fs.writeFileSync(mainPath, "{corrupted json", "utf8");
 
-      // Without recovery flag, loading throws
       expect(() => repo.loadProject("demo-project")).toThrow();
 
-      // With allowAutosaveRecovery, recovers cleanly
       const recovered = repo.loadProject("demo-project", { allowAutosaveRecovery: true });
       expect(recovered.name).toBe("Autosaved Title");
 
-      // Legacy v0.1.0 schema migration check
       const migrated = migrateProjectSchema({
         schemaVersion: LEGACY_SCHEMA_VERSION,
         id: "legacy-1",
