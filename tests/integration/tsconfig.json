@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@frameforge/project-schema": ["../../packages/project-schema/src/index.ts"],
+      "@frameforge/timeline-engine": ["../../packages/timeline-engine/src/index.ts"],
+      "@frameforge/media-engine": ["../../packages/media-engine/src/index.ts"],
+      "@frameforge/render-engine": ["../../packages/render-engine/src/index.ts"],
+      "@frameforge/ai-adapters": ["../../packages/ai-adapters/src/index.ts"],
+      "@frameforge/mcp-dev-server": ["../../mcp/dev-server/src/index.ts"],
+      "@frameforge/mcp-video-server": ["../../mcp/video-server/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

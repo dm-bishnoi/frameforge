@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "baseUrl": ".",
+    "paths": {
+      "@frameforge/project-schema": ["../../packages/project-schema/src/index.ts"],
+      "@frameforge/timeline-engine": ["../../packages/timeline-engine/src/index.ts"],
+      "@frameforge/media-engine": ["../../packages/media-engine/src/index.ts"],
+      "@frameforge/render-engine": ["../../packages/render-engine/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

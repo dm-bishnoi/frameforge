@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "frameforge-dev-mcp": {
+      "command": "node",
+      "args": ["./mcp/dev-server/dist/cli.js"],
+      "env": {
+        "FRAMEFORGE_REPO_ROOT": "."
+      }
+    },
+    "frameforge-video-mcp": {
+      "command": "node",
+      "args": ["./mcp/video-server/dist/cli.js"],
+      "env": {
+        "FRAMEFORGE_WORKSPACE_ROOT": "./workspace-data"
+      }
+    }
+  }
+}

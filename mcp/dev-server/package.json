@@ -1,0 +1,25 @@
+{
+  "name": "@frameforge/mcp-dev-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "frameforge-dev-mcp": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@frameforge/project-schema": "workspace:*",
+    "zod": "^3.24.1"
+  }
+}

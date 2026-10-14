@@ -1,0 +1,11 @@
+# Codex MCP Client Configuration (config.toml)
+
+[mcp_servers.frameforge-dev-mcp]
+command = "node"
+args = ["./mcp/dev-server/dist/cli.js"]
+env = { FRAMEFORGE_REPO_ROOT = "." }
+
+[mcp_servers.frameforge-video-mcp]
+command = "node"
+args = ["./mcp/video-server/dist/cli.js"]
+env = { FRAMEFORGE_WORKSPACE_ROOT = "./workspace-data" }
